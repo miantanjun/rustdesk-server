@@ -1,0 +1,39 @@
+name: build-hbbs-arm64
+
+# 只编 aarch64 (musl) 的 hbbs，给 OpenWrt 路由器用
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.90 --profile minimal
+          rustup default 1.90
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build hbbs
+        run: cross build --release --target aarch64-unknown-linux-musl --bin hbbs
+
+      - name: Exec chmod
+        run: chmod -v a+x target/aarch64-unknown-linux-musl/release/hbbs
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-aarch64-musl
+          path: target/aarch64-unknown-linux-musl/release/hbbs
+          if-no-files-found: error

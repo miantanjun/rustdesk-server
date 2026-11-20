@@ -76,7 +76,30 @@ struct Inner {
     software_url: String,
     mask: Option<Ipv4Network>,
     local_ip: String,
+    public_ip: Option<std::net::IpAddr>,
     sk: Option<sign::SecretKey>,
+}
+
+/// 是否私网 / 回环 / 链路本地 / 未指定地址
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// 私网地址 -> 公网出口 IP，端口保持不变（打洞依赖这个端口做回程 DNAT）
+fn expose_addr(addr: SocketAddr, public_ip: Option<std::net::IpAddr>) -> SocketAddr {
+    match public_ip {
+        Some(pip) if pip != addr.ip() && is_private_ip(&addr.ip()) => {
+            SocketAddr::new(pip, addr.port())
+        }
+        _ => addr,
+    }
 }
 
 #[derive(Clone)]
@@ -117,6 +140,11 @@ impl RendezvousServer {
             log::info!("software_url: {}, version: {}", software_url, version);
         }
         let mask = get_arg("mask").parse().ok();
+        let public_ip = std::env::var("RS_PUBLIC_IP")
+            .or_else(|_| std::env::var("PUBLIC_IP"))
+            .ok()
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
+        log::info!("public-ip (LAN 地址替换) = {:?}", public_ip);
         let local_ip = if mask.is_none() {
             "".to_owned()
         } else {
@@ -141,6 +169,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                public_ip,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -621,7 +650,8 @@ impl RendezvousServer {
         );
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
-            socket_addr: AddrMangle::encode(addr).into(),
+            socket_addr: AddrMangle::encode(expose_addr(addr, self.inner.public_ip))
+                .into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
             ..Default::default()
@@ -743,7 +773,8 @@ impl RendezvousServer {
                         _ => false,
                     }
                 });
-            let socket_addr = AddrMangle::encode(addr).into();
+            let socket_addr = AddrMangle::encode(expose_addr(addr, self.inner.public_ip))
+                .into();
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
