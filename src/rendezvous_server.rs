@@ -92,6 +92,149 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+
+// ==================== 公网 IP 自动探测（STUN） ====================
+// 0 表示「未知」。IPv4 直接塞进 u32，读侧无锁、无分配。
+static PUBLIC_IP_V4: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn pubip_set(ip: Option<std::net::Ipv4Addr>) {
+    let v = ip.map(|x| u32::from(x)).unwrap_or(0);
+    PUBLIC_IP_V4.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pubip_get() -> Option<std::net::IpAddr> {
+    let v = PUBLIC_IP_V4.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        None
+    } else {
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(v)))
+    }
+}
+
+fn pubip_is_usable(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        // 100.64.0.0/10 运营商级 NAT，不是真公网
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        // 保留段
+        || o[0] == 0
+        || o[0] >= 240)
+}
+
+/// 手写 STUN Binding Request，取 XOR-MAPPED-ADDRESS 的 IP 部分
+fn stun_query(server: &str, timeout_ms: u64) -> Option<std::net::Ipv4Addr> {
+    use std::net::{ToSocketAddrs, UdpSocket};
+    let target = (server.to_socket_addrs().ok()?)
+        .find(|a| a.is_ipv4())?;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(timeout_ms)))
+        .ok()?;
+
+    let mut req = Vec::with_capacity(20);
+    req.extend_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+    req.extend_from_slice(&0u16.to_be_bytes()); // length
+    req.extend_from_slice(&0x2112A442u32.to_be_bytes()); // magic cookie
+    // 12 字节 transaction id（够随机即可）
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64) << 32;
+    let mut txn = [0u8; 12];
+    let mut s = seed | 1;
+    for b in txn.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *b = (s & 0xff) as u8;
+    }
+    req.extend_from_slice(&txn);
+
+    sock.send_to(&req, target).ok()?;
+    let mut buf = [0u8; 1500];
+    let (n, _) = sock.recv_from(&mut buf).ok()?;
+    if n < 20 {
+        return None;
+    }
+    if u16::from_be_bytes([buf[0], buf[1]]) != 0x0101 {
+        return None; // 不是 Binding Success Response
+    }
+    let body_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let end = (20 + body_len).min(n);
+    let mut i = 20usize;
+    while i + 4 <= end {
+        let at = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let al = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        i += 4;
+        if i + al > end {
+            break;
+        }
+        let val = &buf[i..i + al];
+        if al >= 8 && val[1] == 0x01 {
+            // family = IPv4
+            let mut a = [val[4], val[5], val[6], val[7]];
+            if at == 0x0020 {
+                // XOR-MAPPED-ADDRESS
+                let cookie = [0x21u8, 0x12, 0xA4, 0x42];
+                for k in 0..4 {
+                    a[k] ^= cookie[k];
+                }
+                return Some(std::net::Ipv4Addr::from(a));
+            } else if at == 0x0001 {
+                return Some(std::net::Ipv4Addr::from(a));
+            }
+        }
+        i += al;
+        i += (4 - (al % 4)) % 4; // 4 字节对齐
+    }
+    None
+}
+
+/// 后台线程：每 30 秒刷新一次公网 IP；变了才打日志
+fn spawn_pubip_watcher() {
+    std::thread::spawn(|| {
+        const SERVERS: &[&str] = &[
+            "stun.miwifi.com:3478",
+            "stun.qq.com:3478",
+            "stun.chat.bilibili.com:3478",
+            "stun.hitv.com:3478",
+            "stun.l.google.com:19302",
+        ];
+        let mut last: u32 = PUBLIC_IP_V4.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let mut found = None;
+            for s in SERVERS {
+                if let Some(ip) = stun_query(s, 1200) {
+                    if pubip_is_usable(ip) {
+                        found = Some(ip);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(ip) => {
+                    let v = u32::from(ip);
+                    if v != last {
+                        log::info!("public-ip auto -> {} (STUN)", ip);
+                        last = v;
+                    }
+                    PUBLIC_IP_V4.store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => {
+                    if last == 0 {
+                        log::warn!("public-ip auto: 所有 STUN 服务器均无响应，稍后重试");
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+}
+
 /// 私网地址 -> 公网出口 IP，端口保持不变（打洞依赖这个端口做回程 DNAT）
 fn expose_addr(addr: SocketAddr, public_ip: Option<std::net::IpAddr>) -> SocketAddr {
     match public_ip {
@@ -140,11 +283,33 @@ impl RendezvousServer {
             log::info!("software_url: {}, version: {}", software_url, version);
         }
         let mask = get_arg("mask").parse().ok();
-        let public_ip = std::env::var("RS_PUBLIC_IP")
+        // ---- 公网 IP：auto / 手动 / 未设置 ----
+        let raw = std::env::var("RS_PUBLIC_IP")
             .or_else(|_| std::env::var("PUBLIC_IP"))
+            .unwrap_or_default();
+        let raw = raw.trim().to_string();
+        // STUN 失败时的兜底（启动脚本用 ubus 取 WAN 地址注入）
+        let fallback = std::env::var("RS_PUBLIC_IP_FALLBACK")
             .ok()
-            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
-        log::info!("public-ip (LAN 地址替换) = {:?}", public_ip);
+            .and_then(|v| v.trim().parse::<std::net::Ipv4Addr>().ok())
+            .filter(|ip| pubip_is_usable(*ip));
+        if let Some(ip) = fallback {
+            pubip_set(Some(ip));
+        }
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") || raw == "0.0.0.0" {
+            log::info!(
+                "public-ip = auto（STUN 自动探测，每 30s 刷新；初始兜底 {:?}）",
+                fallback
+            );
+            spawn_pubip_watcher();
+        } else if let Some(ip) = raw.parse::<std::net::Ipv4Addr>().ok() {
+            pubip_set(Some(ip));
+            log::info!("public-ip = {}（手动固定）", ip);
+        } else {
+            log::warn!("public-ip 值 {:?} 无法解析，退回 auto", raw);
+            spawn_pubip_watcher();
+        }
+        let public_ip = pubip_get();
         let local_ip = if mask.is_none() {
             "".to_owned()
         } else {
@@ -650,7 +815,7 @@ impl RendezvousServer {
         );
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
-            socket_addr: AddrMangle::encode(expose_addr(addr, self.inner.public_ip))
+            socket_addr: AddrMangle::encode(expose_addr(addr, pubip_get()))
                 .into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
@@ -773,7 +938,7 @@ impl RendezvousServer {
                         _ => false,
                     }
                 });
-            let socket_addr = AddrMangle::encode(expose_addr(addr, self.inner.public_ip))
+            let socket_addr = AddrMangle::encode(expose_addr(addr, pubip_get()))
                 .into();
             if same_intranet {
                 log::debug!(
